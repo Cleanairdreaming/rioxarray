@@ -230,6 +230,32 @@ def _write_metatata_to_raster(raster_handle, xarray_dataset, tags):
                 raster_handle.set_band_description(iii + 1, band_description)
 
 
+def _filter_profile(in_profile, windowed):
+    """
+    Prepare the profile for writing raster with rasterio
+    """
+    # filter out the generated attributes
+    out_profile = {
+        key: value
+        for key, value in in_profile.items()
+        if key
+        not in (
+            "driver",
+            "height",
+            "width",
+            "crs",
+            "transform",
+            "nodata",
+            "count",
+            "dtype",
+        )
+    }
+    if windowed and not out_profile.get("tiled"):
+        warnings.warn("Set tiled=True for windowed writing.")
+        out_profile["tiled"] = True
+    return out_profile
+
+
 class XRasterBase(object):
     """This is the base class for the GIS extensions for xarray"""
 
@@ -494,6 +520,84 @@ class XRasterBase(object):
         """tuple: Returns the shape (width, height)"""
         return (self.width, self.height)
 
+    def resolution(self, recalc=False):
+        """Determine the resolution of the `xarray.Dataset` or `xarray.DataArray`
+
+        Parameters
+        ----------
+        recalc: bool, optional
+            Will force the resolution to be recalculated instead of using the
+            transform attribute.
+
+        """
+        if not recalc or self.width == 1 or self.height == 1:
+            try:
+                # get resolution from xarray rasterio
+                data_transform = Affine(*self._obj.attrs["transform"][:6])
+                resolution_x = data_transform.a
+                resolution_y = data_transform.e
+                recalc = False
+            except KeyError:
+                recalc = True
+
+        if recalc:
+            left, bottom, right, top = self._internal_bounds()
+
+            if self.width == 1 or self.height == 1:
+                raise OneDimensionalRaster(
+                    "Only 1 dimenional array found. Cannot calculate the resolution."
+                )
+
+            resolution_x = (right - left) / (self.width - 1)
+            resolution_y = (bottom - top) / (self.height - 1)
+
+        return resolution_x, resolution_y
+
+    def _internal_bounds(self):
+        """Determine the internal bounds of the `xarray.DataArray`"""
+        left = float(self._obj[self.x_dim][0])
+        right = float(self._obj[self.x_dim][-1])
+        top = float(self._obj[self.y_dim][0])
+        bottom = float(self._obj[self.y_dim][-1])
+        return left, bottom, right, top
+
+    def bounds(self, recalc=False):
+        """Determine the bounds of the `xarray.DataArray`
+
+        Parameters
+        ----------
+        recalc: bool, optional
+            Will force the bounds to be recalculated instead of using the
+            transform attribute.
+
+        Returns
+        -------
+        left, bottom, right, top: float
+            Outermost coordinates.
+        """
+        left, bottom, right, top = self._internal_bounds()
+        src_resolution_x, src_resolution_y = self.resolution(recalc=recalc)
+        left -= src_resolution_x / 2.0
+        right += src_resolution_x / 2.0
+        top -= src_resolution_y / 2.0
+        bottom += src_resolution_y / 2.0
+        return left, bottom, right, top
+
+    def transform(self, recalc=False):
+        """Determine the affine of the `xarray.DataArray` or `xarray.Dataset`"""
+        if not recalc:
+            try:
+                # get affine from xarray rasterio
+                return Affine(*self._obj.attrs["transform"][:6])
+            except KeyError:
+                pass
+        src_bounds = self.bounds(recalc=recalc)
+        src_left, _, _, src_top = src_bounds
+        src_resolution_x, src_resolution_y = self.resolution(recalc=recalc)
+        return Affine.translation(src_left, src_top) * Affine.scale(
+            src_resolution_x, src_resolution_y
+        )
+
 
 @xarray.register_dataarray_accessor("rio")
 class RasterArray(XRasterBase):
@@ -588,49 +692,8 @@ class RasterArray(XRasterBase):
         if self._nodata is None:
             self._nodata = False
             return None
-
+        self._nodata = self._obj.dtype.type(self._nodata)
         return self._nodata
-
-    def resolution(self, recalc=False):
-        """Determine the resolution of the `xarray.DataArray`
-
-        Parameters
-        ----------
-        recalc: bool, optional
-            Will force the resolution to be recalculated instead of using the
-            transform attribute.
-
-        """
-        if not recalc or self.width == 1 or self.height == 1:
-            try:
-                # get resolution from xarray rasterio
-                data_transform = Affine(*self._obj.attrs["transform"][:6])
-                resolution_x = data_transform.a
-                resolution_y = data_transform.e
-                recalc = False
-            except KeyError:
-                recalc = True
-
-        if recalc:
-            left, bottom, right, top = self._internal_bounds()
-
-            if self.width == 1 or self.height == 1:
-                raise OneDimensionalRaster(
-                    "Only 1 dimenional array found. Cannot calculate the resolution."
-                )
-
-            resolution_x = (right - left) / (self.width - 1)
-            resolution_y = (bottom - top) / (self.height - 1)
-
-        return resolution_x, resolution_y
-
-    def _internal_bounds(self):
-        """Determine the internal bounds of the `xarray.DataArray`"""
-        left = float(self._obj[self.x_dim][0])
-        right = float(self._obj[self.x_dim][-1])
-        top = float(self._obj[self.y_dim][0])
-        bottom = float(self._obj[self.y_dim][-1])
-        return left, bottom, right, top
 
     def _check_dimensions(self):
         """
@@ -662,6 +725,14 @@ class RasterArray(XRasterBase):
 
     @property
     def count(self):
+        """
+        The equivalent to count for a rasterio Dataset
+        (i.e. the number of bands).
+
+        Returns
+        -------
+        int
+        """
         if self._count is not None:
             return self._count
         extra_dim = self._check_dimensions()
@@ -669,28 +740,6 @@ class RasterArray(XRasterBase):
         if extra_dim is not None:
             self._count = self._obj[extra_dim].size
         return self._count
-
-    def bounds(self, recalc=False):
-        """Determine the bounds of the `xarray.DataArray`
-
-        Parameters
-        ----------
-        recalc: bool, optional
-            Will force the bounds to be recalculated instead of using the
-            transform attribute.
-
-        Returns
-        -------
-        left, bottom, right, top: float
-            Outermost coordinates.
-        """
-        left, bottom, right, top = self._internal_bounds()
-        src_resolution_x, src_resolution_y = self.resolution(recalc=recalc)
-        left -= src_resolution_x / 2.0
-        right += src_resolution_x / 2.0
-        top -= src_resolution_y / 2.0
-        bottom += src_resolution_y / 2.0
-        return left, bottom, right, top
 
     def transform_bounds(self, dst_crs, densify_pts=21, recalc=False):
         """Transform bounds from src_crs to dst_crs.
@@ -719,21 +768,6 @@ class RasterArray(XRasterBase):
         """
         return rasterio.warp.transform_bounds(
             self.crs, dst_crs, *self.bounds(recalc=recalc), densify_pts=densify_pts
-        )
-
-    def transform(self, recalc=False):
-        """Determine the affine of the `xarray.DataArray`"""
-        if not recalc:
-            try:
-                # get affine from xarray rasterio
-                return Affine(*self._obj.attrs["transform"][:6])
-            except KeyError:
-                pass
-        src_bounds = self.bounds(recalc=recalc)
-        src_left, _, _, src_top = src_bounds
-        src_resolution_x, src_resolution_y = self.resolution(recalc=recalc)
-        return Affine.translation(src_left, src_top) * Affine.scale(
-            src_resolution_x, src_resolution_y
         )
 
     def reproject(
@@ -787,30 +821,19 @@ class RasterArray(XRasterBase):
         else:
             dst_data = np.zeros((dst_height, dst_width), dtype=self._obj.dtype.type)
 
-        try:
-            dst_nodata = self._obj.dtype.type(
-                self.nodata if self.nodata is not None else -9999
-            )
-        except ValueError:
-            # if integer, set nodata to -9999
-            dst_nodata = self._obj.dtype.type(-9999)
-
-        src_nodata = self._obj.dtype.type(
-            self.nodata if self.nodata is not None else dst_nodata
-        )
         rasterio.warp.reproject(
             source=np.copy(self._obj.load().data),
             destination=dst_data,
             src_transform=src_affine,
             src_crs=self.crs,
-            src_nodata=src_nodata,
+            src_nodata=self.nodata,
             dst_transform=dst_affine,
             dst_crs=dst_crs,
-            dst_nodata=dst_nodata,
+            dst_nodata=self.nodata,
             resampling=resampling,
         )
         # add necessary attributes
-        new_attrs = _generate_attrs(self._obj, dst_affine, dst_nodata)
+        new_attrs = _generate_attrs(self._obj, dst_affine, self.nodata)
         # make sure dimensions with coordinates renamed to x,y
         dst_dims = []
         for dim in self._obj.dims:
@@ -1180,26 +1203,7 @@ class RasterArray(XRasterBase):
         except AttributeError:
             out_profile = {}
         out_profile.update(profile_kwargs)
-
-        # filter out the generated attributes
-        out_profile = {
-            key: value
-            for key, value in out_profile.items()
-            if key
-            not in (
-                "driver",
-                "height",
-                "width",
-                "crs",
-                "transform",
-                "nodata",
-                "count",
-                "dtype",
-            )
-        }
-        if windowed and not out_profile.get("tiled"):
-            warnings.warn("Set tiled=True for windowed writing.")
-            out_profile["tiled"] = True
+        out_profile = _filter_profile(out_profile, windowed=windowed)
         with rasterio.open(
             raster_path,
             "w",
@@ -1452,3 +1456,89 @@ class RasterDataset(XRasterBase):
         for var in self.vars:
             interpolated_dataset[var] = self._obj[var].rio.interpolate_na(method=method)
         return interpolated_dataset
+
+    def to_raster(
+        self,
+        raster_path,
+        driver="GTiff",
+        dtype=None,
+        tags=None,
+        windowed=False,
+        recalc_transform=True,
+        **profile_kwargs,
+    ):
+        """
+        Export the DataArray to a raster file.
+
+        Parameters
+        ----------
+        raster_path: str
+            The path to output the raster to.
+        driver: str, optional
+            The name of the GDAL/rasterio driver to use to export the raster.
+            Default is "GTiff".
+        dtype: str, optional
+            The data type to write the raster to. Default is the datasets dtype.
+        tags: dict, optional
+            A dictionary of tags to write to the raster.
+        windowed: bool, optional
+            If True, it will write using the windows of the output raster.
+            This only works if the output raster is tiled. As such, if you
+            set this to True, the output raster will be tiled.
+            Default is False.
+        **profile_kwargs
+            Additional keyword arguments to pass into writing the raster. The
+            nodata, transform, crs, count, width, and height attributes
+            are ignored.
+
+        """
+        if set(list(self._obj.dims)) - set([self.x_dim, self.y_dim]):
+            raise TooManyDimensions(
+                "Only 2D data are supported. "
+                "'squeeze()', 'sel()' or 'isel()' can help."
+            )
+        dtype = str(self._obj.dtype) if dtype is None else dtype
+        out_profile = _filter_profile(profile_kwargs)
+        # get the nodata from the first data_var and
+        # assume they are all the same
+        data_var = self.vars[0]
+        encoded_nodata = self._obj[data_var].rio.encoded_nodata
+        nodata = (
+            encoded_nodata
+            if encoded_nodata is not None
+            else self._obj[data_var].rio.nodata
+        )
+    
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver=driver,
+            height=int(self.height),
+            width=int(self.width),
+            count=len(self.data_vars),
+            dtype=dtype,
+            crs=self.crs,
+            transform=self.transform(recalc=recalc_transform),
+            nodata=nodata,
+            **out_profile,
+        ) as dst:
+
+            _write_metatata_to_raster(dst, self._obj, tags)
+
+            # write data to raster
+            if windowed:
+                window_iter = dst.block_windows(1)
+            else:
+                window_iter = [(None, None)]
+            for _, window in window_iter:
+                if window is not None:
+                    out_data = self.isel_window(window)
+                else:
+                    out_data = self._obj
+                if encoded_nodata is not None:
+                    out_data = out_data.fillna(encoded_nodata)
+                data = out_data.astype(dtype).load().data
+                if data.ndim == 2:
+                    dst.write(data, 1, window=window)
+                else:
+                    dst.write(data, window=window)
